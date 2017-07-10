@@ -9,17 +9,26 @@
 
 typedef struct
 {
+  /*inputs*/
   char *strPfrmName;
   uint8_t u8PfmIndx;
+  
+  uint8_t u8KrnlArgCnt;
+  void **ptr_memHost;
+  cl_mem_flags *ptr_memDevFlgs;
+  size_t *ptr_memSz;
 
+  /*platform related internals*/
   cl_context ctxID;
   cl_device_id *ptr_devices;
   cl_uint uDeviceCount;
 
+  /*host to device communication path*/
   cl_command_queue *ptr_cmdQs;
 
-  cl_mem *ptr_memBuff;
-
+  cl_mem *ptr_memDev;
+  
+  /*kernel related internals*/
   cl_program pgmID;
 
   cl_kernel krnID;
@@ -189,7 +198,7 @@ void _print_device_info(cl_device_id devID)
       break;
     case type_size_t_arr:
       printf("\n");
-      for (size_t j = 0; j < szReturn/sizeof(size_t); j++)
+      for (size_t j = 0; j < szReturn / sizeof(size_t); j++)
       {
         printf("\t\t%u:%u\n", j, *(size_t*)(buffer + (sizeof(size_t) * j)));
       }
@@ -233,22 +242,21 @@ cl_int nErrCde;
 
 cl_context acc_create_context(char *strPlatformName, cl_uint uDeviceCount, tagCL_KERNEL *ptrkrnlVal)
 {
-  for (size_t i=0;i<gclPlatformCount;i++)
+  for (size_t i = 0; i < gclPlatformCount; i++)
   {
     char strTemp[128];
 
     clGetPlatformInfo(gptr_platforms[i].pfmID, CL_PLATFORM_NAME, 128, strTemp, NULL);
-    if (strstr(strTemp,strPlatformName))
+    if (strstr(strTemp, strPlatformName))
     {
       cl_context_properties properties[3] =
       {
-        CL_CONTEXT_PLATFORM, (cl_context_properties)0,
+        CL_CONTEXT_PLATFORM, (cl_context_properties)gptr_platforms[i].pfmID,
         (cl_context_properties)NULL
       };
-      properties[1] = (cl_context_properties)gptr_platforms[i].pfmID;
 
       //found the match
-      if(ptrkrnlVal)
+      if (ptrkrnlVal)
       {
         ptrkrnlVal->u8PfmIndx = i;
         ptrkrnlVal->ctxID = clCreateContext(properties, uDeviceCount, gptr_platforms[i].ptr_devices, NULL, NULL, NULL);
@@ -257,14 +265,14 @@ cl_context acc_create_context(char *strPlatformName, cl_uint uDeviceCount, tagCL
         clGetContextInfo(ptrkrnlVal->ctxID, CL_CONTEXT_DEVICES, sizeof(cl_device_id) * uDeviceCount, ptrkrnlVal->ptr_devices, NULL);
 
         ptrkrnlVal->ptr_cmdQs = malloc(sizeof(cl_command_queue) * uDeviceCount);
-        for (size_t j=0;j<uDeviceCount;j++)
+        for (size_t j = 0; j < uDeviceCount; j++)
         {
-          ptrkrnlVal->ptr_cmdQs[j] = clCreateCommandQueue(ptrkrnlVal->ctxID, ptrkrnlVal->ptr_devices[j], NULL, &nErrCde);
-		      if (nErrCde != CL_SUCCESS)
-		      {
+          ptrkrnlVal->ptr_cmdQs[j] = clCreateCommandQueueWithProperties(ptrkrnlVal->ctxID, ptrkrnlVal->ptr_devices[j], NULL, &nErrCde);
+          if (nErrCde != CL_SUCCESS)
+          {
             printf("Command Q creation Failed: %d\n", nErrCde);
             break;
-		      }
+          }
         }
 
         return ptrkrnlVal->ctxID;
@@ -351,42 +359,96 @@ cl_uint SetKernelArguments(ocl_args_d_t *ocl)
 
   return err;
 }
+#endif
 
-/*
-* Execute the kernel
-*/
 cl_uint acc_exec_kernel(tagCL_KERNEL *ptrkrnVal, cl_uint width, cl_uint height)
 {
   cl_int err = CL_SUCCESS;
+
+  //OpenCL_host_2_device_exchange_global_memory_mapping_and_allocation
+  ptrkrnVal->ptr_memDev = (void*)malloc(sizeof(cl_mem) * ptrkrnVal->u8KrnlArgCnt);
+  for (size_t i = 0; i < ptrkrnVal->u8KrnlArgCnt; i++)
+  {
+    ptrkrnVal->ptr_memDev[i] = clCreateBuffer(ptrkrnVal->ctxID, ptrkrnVal->ptr_memDevFlgs[i], ptrkrnVal->ptr_memSz[i], ptrkrnVal->ptr_memHost[i], &err);
+    if (CL_SUCCESS != err)
+    {
+      printf("Error: clCreateBuffer for %d returned %d\n", i, err);
+      return err;
+    }
+
+    //set the kernel argurment
+    err = clSetKernelArg(ptrkrnVal->krnID, i, sizeof(cl_mem), (void *)&ptrkrnVal->ptr_memDev[i]);
+    if (CL_SUCCESS != err)
+    {
+      printf("error: Failed to set argument for %d, returned %d\n", i, err);
+      return err;
+    }
+
+    //transfer the data from host to device
+    if (ptrkrnVal->ptr_memDevFlgs[i] & (CL_MEM_READ_ONLY |CL_MEM_READ_WRITE))
+    {
+      err = clEnqueueWriteBuffer(ptrkrnVal->ptr_cmdQs[0], ptrkrnVal->ptr_memDev[i], CL_TRUE, 0, ptrkrnVal->ptr_memSz[i], ptrkrnVal->ptr_memHost[i], 0, NULL, NULL);
+      if (CL_SUCCESS != err)
+      {
+        printf("Error: clEnqueueWriteBuffer for %d returned %d\n", i, err);
+        return err;
+      }
+    }
+  }
 
   // Define global iteration space for clEnqueueNDRangeKernel.
   size_t globalWorkSize[2] = { width, height };
   size_t localWorkSize[2] = { 1, 1 };
 
   // execute kernel
-  err = clEnqueueNDRangeKernel(ptrkrnVal->ptr_cmdQs[0], ptrkrnVal->krnID, 2, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL);
+  err = clEnqueueNDRangeKernel(ptrkrnVal->ptr_cmdQs[0], ptrkrnVal->krnID, 1, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL);
   if (CL_SUCCESS != err)
   {
-    LogError("Error: Failed to run kernel, return %s\n", TranslateOpenCLError(err));
+    printf("Error: Failed to run kernel, return %d\n", (err));
     return err;
   }
 
   // Wait until the queued kernel is completed by the device
-  err = clFinish(ocl->commandQueue);
+  err = clFinish(ptrkrnVal->ptr_cmdQs[0]);
   if (CL_SUCCESS != err)
   {
-    LogError("Error: clFinish return %s\n", TranslateOpenCLError(err));
+    printf("Error: clFinish 1 return %d\n", (err));
     return err;
   }
 
+  for (size_t i = 0; i < ptrkrnVal->u8KrnlArgCnt; i++)
+  {
+    //transfer the data from device to host
+    if (ptrkrnVal->ptr_memDevFlgs[i] & (CL_MEM_WRITE_ONLY|CL_MEM_READ_WRITE))
+    {
+      err = clEnqueueReadBuffer(ptrkrnVal->ptr_cmdQs[0], ptrkrnVal->ptr_memDev[i], CL_TRUE, 0, ptrkrnVal->ptr_memSz[i], ptrkrnVal->ptr_memHost[i], 0, NULL, NULL);
+
+      if (CL_SUCCESS != err)
+      {
+        printf("Error: clEnqueueWriteBuffer for %d returned %d\n", i, err);
+        return err;
+      }
+    }
+  }
+
+  // Wait until the queued kernel is completed by the device
+  err = clFinish(ptrkrnVal->ptr_cmdQs[0]);
+  if (CL_SUCCESS != err)
+  {
+    printf("Error: clFinish 2 return %d\n", (err));
+    return err;
+  }
+
+  //TODO: fix the memory leak
+  free(ptrkrnVal->ptr_memDev);
+
   return CL_SUCCESS;
 }
-#endif
 
 void acc_load_kernel(char *strFilePath, char *strOptions, tagCL_KERNEL *ptrkrnVal)
 {
   char *strSource;
-  size_t arrszFileLength[2] = {0};
+  size_t arrszFileLength[2] = { 0 };
   cl_int nErrCde;
 
   FILE *hFile = fopen(strFilePath, "r");
@@ -402,24 +464,24 @@ void acc_load_kernel(char *strFilePath, char *strOptions, tagCL_KERNEL *ptrkrnVa
 
   ptrkrnVal->pgmID = clCreateProgramWithSource(ptrkrnVal->ctxID, ptrkrnVal->uDeviceCount, &strSource, arrszFileLength, &nErrCde);
   free(strSource);
-  if(nErrCde == CL_SUCCESS)
+  if (nErrCde == CL_SUCCESS)
   {
     //build kernel for all the devices
     nErrCde = clBuildProgram(ptrkrnVal->pgmID, 0, NULL, strOptions, NULL, NULL);
-    if(nErrCde == CL_SUCCESS)
+    if (nErrCde == CL_SUCCESS)
     {
-      ptrkrnVal->krnID = clCreateKernel(ptrkrnVal->pgmID, "first", &nErrCde);
+      ptrkrnVal->krnID = clCreateKernel(ptrkrnVal->pgmID, "Add", &nErrCde);
     }
     else
     {
       printf("Kernel Building failed: %d\n", nErrCde);
-	  size_t log_size = 0;
-	  clGetProgramBuildInfo(ptrkrnVal->pgmID, ptrkrnVal->ptr_devices[0], CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+      size_t log_size = 0;
+      clGetProgramBuildInfo(ptrkrnVal->pgmID, ptrkrnVal->ptr_devices[0], CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
 
-	  char *build_log = (void *)malloc(log_size);
-	  clGetProgramBuildInfo(ptrkrnVal->pgmID, ptrkrnVal->ptr_devices[0], CL_PROGRAM_BUILD_LOG, log_size, &build_log[0], NULL);
-	  printf(build_log);
-	  free(build_log);
+      char *build_log = (void *)malloc(log_size);
+      clGetProgramBuildInfo(ptrkrnVal->pgmID, ptrkrnVal->ptr_devices[0], CL_PROGRAM_BUILD_LOG, log_size, &build_log[0], NULL);
+      printf(build_log);
+      free(build_log);
     }
   }
   else
@@ -435,7 +497,7 @@ void acc_init(void)
   //get the platform count
   clGetPlatformIDs(0, NULL, &gclPlatformCount);
   cl_platform_id *platforms = (cl_platform_id*)malloc(sizeof(cl_platform_id) * gclPlatformCount);
-  gptr_platforms = (tagCL_PLATFORM*) malloc(sizeof(tagCL_PLATFORM) * gclPlatformCount);
+  gptr_platforms = (tagCL_PLATFORM*)malloc(sizeof(tagCL_PLATFORM) * gclPlatformCount);
 
   //get the platform ids
   clGetPlatformIDs(gclPlatformCount, platforms, NULL);
@@ -471,7 +533,6 @@ void acc_print_information(void)
   {
     char strTemp[128];
     cl_ulong ulTemp;
-    cl_uint unTemp;
 
     clGetPlatformInfo(gptr_platforms[i].pfmID, CL_PLATFORM_PROFILE, 128, strTemp, NULL);
     printf("\nCL_PLATFORM_PROFILE : %s\n", strTemp);
@@ -493,7 +554,7 @@ void acc_print_information(void)
 
     for (size_t j = 0; j < gptr_platforms[i].uDeviceCount; j++)
     {
-      printf("Device %u of %u\n", j+1, gptr_platforms[i].uDeviceCount);
+      printf("Device %u of %u\n", j + 1, gptr_platforms[i].uDeviceCount);
       _print_device_info(gptr_platforms[i].ptr_devices[j]);
     }
   }
@@ -503,33 +564,71 @@ int main()
 {
   acc_init();
 
-  acc_print_information();
+  //acc_print_information();
 
-  tagCL_KERNEL myKernel = {0};
+  tagCL_KERNEL myKernel = { 0 };
   myKernel.strPfrmName = "Intel(R) OpenCL";
   myKernel.uDeviceCount = 1;
-
+  
   acc_load_kernel("D:\\prj\\OpenCLProject1\\OpenCLProject1\\Template.cl", "", &myKernel);
 
-  if(myKernel.krnID)
+  const int elmsz = 8;
+
+  cl_mem_flags tmpFlgs[3] = { CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR , CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR , CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR };
+  size_t tmpSz[3] = { elmsz, elmsz, elmsz };
+  cl_int *tmpHostBuff[3];
+
+  tmpHostBuff[0] = (void*)_aligned_malloc(sizeof(cl_int) * tmpSz[0], 4096);
+  tmpHostBuff[1] = (void*)_aligned_malloc(sizeof(cl_int) * tmpSz[1], 4096);
+  tmpHostBuff[2] = (void*)_aligned_malloc(sizeof(cl_int) * tmpSz[2], 4096);
+
+  myKernel.u8KrnlArgCnt = 3;
+  myKernel.ptr_memSz = tmpSz;
+  myKernel.ptr_memDevFlgs = tmpFlgs;
+  myKernel.ptr_memHost = (void*)tmpHostBuff;
+
+  for (size_t i = 0; i < elmsz; i++)
+  {
+    *(tmpHostBuff[0] + i) = i; *(tmpHostBuff[1] + i) = i+1; *(tmpHostBuff[2] + i) = 0;
+  }
+
+  printf("Before Kernel execution\n");
+  for (size_t i = 0; i < elmsz; i++)
+  {
+    printf("%d+%d=%d\n", *(tmpHostBuff[0] + i), *(tmpHostBuff[1] + i), *(tmpHostBuff[2] + i));
+  }
+
+  acc_exec_kernel(&myKernel, elmsz, elmsz);
+
+  printf("After Kernel execution\n");
+  for (size_t i = 0; i < elmsz; i++)
+  {
+    printf("%d+%d=%d\n", *(tmpHostBuff[0] + i), *(tmpHostBuff[1] + i), *(tmpHostBuff[2] + i));
+  }
+
+  _aligned_free(tmpHostBuff[0]);
+  _aligned_free(tmpHostBuff[1]);
+  _aligned_free(tmpHostBuff[2]);
+
+  if (myKernel.krnID)
     clReleaseKernel(myKernel.krnID);
 
-  if(myKernel.pgmID)
+  if (myKernel.pgmID)
     clReleaseProgram(myKernel.pgmID);
 
-  if(myKernel.ptr_cmdQs)
+  if (myKernel.ptr_cmdQs)
   {
-    for (size_t i=0;i<myKernel.uDeviceCount;i++)
+    for (size_t i = 0; i < myKernel.uDeviceCount; i++)
     {
       clReleaseCommandQueue(myKernel.ptr_cmdQs[i]);
     }
     free(myKernel.ptr_cmdQs);
   }
 
-  if(myKernel.ptr_devices)
+  if (myKernel.ptr_devices)
     free(myKernel.ptr_devices);
 
-  if(myKernel.ctxID)
+  if (myKernel.ctxID)
     clReleaseContext(myKernel.ctxID);
 
   acc_uninit();
