@@ -267,7 +267,8 @@ cl_context acc_create_context(char *strPlatformName, cl_uint uDeviceCount, tagCL
         ptrkrnlVal->ptr_cmdQs = malloc(sizeof(cl_command_queue) * uDeviceCount);
         for (size_t j = 0; j < uDeviceCount; j++)
         {
-          ptrkrnlVal->ptr_cmdQs[j] = clCreateCommandQueueWithProperties(ptrkrnlVal->ctxID, ptrkrnlVal->ptr_devices[j], NULL, &nErrCde);
+          //ptrkrnlVal->ptr_cmdQs[j] = clCreateCommandQueueWithProperties(ptrkrnlVal->ctxID, ptrkrnlVal->ptr_devices[j], NULL, &nErrCde);
+          ptrkrnlVal->ptr_cmdQs[j] = clCreateCommandQueue(ptrkrnlVal->ctxID, ptrkrnlVal->ptr_devices[j], NULL, &nErrCde);
           if (nErrCde != CL_SUCCESS)
           {
             printf("Command Q creation Failed: %d\n", nErrCde);
@@ -570,7 +571,7 @@ int main()
   myKernel.strPfrmName = "Intel(R) OpenCL";
   myKernel.uDeviceCount = 1;
   
-  acc_load_kernel("D:\\prj\\OpenCLProject1\\OpenCLProject1\\Template.cl", "", &myKernel);
+  acc_load_kernel("D:\\prj\\OpenCL_Sample_1\\OpenCLProject1\\Template.cl", "-g", &myKernel);
 
   const int elmsz = 8;
 
